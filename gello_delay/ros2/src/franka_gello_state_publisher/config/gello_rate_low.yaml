@@ -1,0 +1,20 @@
+# GELLO config: LOW mode (smooth teleoperation with lag)
+# publishing_rate: 25 Hz (high-frequency target stream, keeps motion smooth)
+# delay: 0.5 s (robot follows the master 0.5 s behind, no stutter)
+# Use case: slow/cautious teleoperation, debugging, data collection
+
+SINGLE:
+  namespace: ""
+  com_port: "usb-1a86_USB_Serial-if00-port0"
+  num_arm_joints: 7
+  joint_signs: [1, -1, 1, 1, 1, -1, 1]
+  gripper: true
+  publishing_rate: 25  # Hz (target stream rate, not the lag)
+  delay: 0.5  # s (lag: robot follows master 0.5 s behind)
+  assembly_offsets: [0.000, 0.000, 1.571, 1.571, 4.712, 1.571, 3.928] # rad
+  gripper_range_rad: [2.02, 1.26]  # Inverted: fixes reversed gripper control
+  dynamixel_torque_enable: [     0,     0,     0,     0,     0,     0,     0,     0]
+  dynamixel_goal_position: [   0.0,   0.0,   0.0,-1.571,   0.0, 1.571,   0.0, 3.509]
+  dynamixel_kp_p:          [    30,    60,     0,    30,     0,     0,     0,    50]
+  dynamixel_kp_i:          [     0,     0,     0,     0,     0,     0,     0,     0]
+  dynamixel_kp_d:          [   250,   100,    80,    60,    30,    10,     5,     0]

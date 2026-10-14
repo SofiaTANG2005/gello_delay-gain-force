@@ -1,0 +1,15 @@
+SINGLE:
+  namespace: ""
+  com_port: "usb-1a86_USB_Serial-if00-port0"
+  num_arm_joints: 7
+  joint_signs: [1, -1, 1, 1, 1, -1, 1]
+  gripper: true
+  publishing_rate: 25
+  gain: 0.5
+  assembly_offsets: [0.000, 0.000, 1.571, 1.571, 4.712, 1.571, 3.928]
+  gripper_range_rad: [2.02, 1.26]
+  dynamixel_torque_enable: [0,0,0,0,0,0,0,0]
+  dynamixel_goal_position: [0.0,0.0,0.0,-1.571,0.0,1.571,0.0,3.509]
+  dynamixel_kp_p: [30,60,0,30,0,0,0,50]
+  dynamixel_kp_i: [0,0,0,0,0,0,0,0]
+  dynamixel_kp_d: [250,100,80,60,30,10,5,0]

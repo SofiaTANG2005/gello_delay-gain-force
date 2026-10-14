@@ -1,0 +1,422 @@
+<title>gello遥操作:gello_basic</title>
+
+<p>本文面向需要部署、使用、调试和二次开发 <code>gello_basic</code> 的工程人员。文档以仓库当前代码为准，从系统边界和整体架构出发，沿真实数据链路解释 GELLO 主手如何经过 Dynamixel、ROS 2、ros2_control 和 Franka 接口驱动 FR3 机械臂与夹爪。文中同时说明仓库保留的 Python/ZMQ 通用框架，但重点是根目录 <code>start_gello.sh</code> 启动的 FR3 真机 ROS 2 路径。</p>
+
+<callout emoji="❗" background-color="light-red" border-color="red">
+  <p><b>安全前提：</b>这是一条真机力矩控制链路。首次启动、修改关节符号或装配偏置、切换机械臂、改动刚度/阻尼参数时，必须确保急停可达、工作空间无人、GELLO 与 FR3 初始姿态接近，并以低风险姿态逐轴验证。不要把“topic 存在”当作“数据正确”。</p>
+</callout>
+
+<h1>1. 系统定位与整体架构</h1>
+
+<p><code>gello_basic</code> 的核心目标是实现同构关节空间遥操作：操作者直接推动 GELLO 主手，系统读取主手各 Dynamixel 关节的角度，将其映射为 FR3 的七维目标关节位置；FR3 侧的实时控制器持续比较目标位置与实际位置，并输出关节力矩。夹爪不进入手臂力矩环，而是走独立的 ROS 2 topic 和 Franka action 链路。</p>
+
+<pre lang="text" caption="当前单臂 FR3 真机链路"><code>操作者
+  │ 推动 GELLO
+  ▼
+GELLO 7 个臂关节 + 1 个夹爪 Dynamixel
+  │ USB 串口，Protocol 2.0，57600 baud
+  ▼
+GelloHardware / DynamixelDriver
+  │ 原始角度 → offset/sign → 连续角 → FR3 限位裁剪
+  ▼ 25 Hz
+gello_publisher
+  ├─ sensor_msgs/JointState → /gello/joint_states
+  │                                │
+  │                                ▼
+  │                       JointImpedanceController
+  │                                │ 1 kHz
+  │                                ▼
+  │                       7 轴 effort command
+  │                                │
+  │                                ▼
+  │                       franka_hardware → FR3
+  │
+  └─ std_msgs/Float32 → /gripper/gripper_client/target_gripper_width_percent
+                                   │
+                                   ▼
+                          franka_gripper_client
+                                   │ Homing / Move action
+                                   ▼
+                             Franka Hand</code></pre>
+
+<p>系统中存在三个不同频率层级。GELLO 发布器以 25 Hz 产生目标；<code>joint_state_publisher</code> 默认以 30 Hz 汇总机器人与夹爪状态；<code>controller_manager</code> 以 1000 Hz 执行控制器更新。25 Hz 不是 FR3 的力矩控制频率，它只是目标刷新频率；两个 GELLO 消息之间，控制器在 1 kHz 循环中保持最近一次有效目标并持续计算力矩。</p>
+
+<h2>1.1 两条并存但用途不同的遥操作路径</h2>
+
+<table>
+  <thead><tr><th>路径</th><th>主要入口</th><th>通信与执行方式</th><th>当前用途</th></tr></thead>
+  <tbody>
+    <tr><td>FR3 ROS 2 专用路径</td><td><code>start_gello.sh</code></td><td>ROS 2 topic + ros2_control + Franka action</td><td>当前项目的 FR3 真机遥操作主路径，也是本文重点</td></tr>
+    <tr><td>上游 Python/ZMQ 通用路径</td><td><code>experiments/launch_yaml.py</code>、<code>experiments/run_env.py</code></td><td>Agent/Robot 抽象 + ZMQ RPC + Python 控制循环</td><td>YAM、UR、xArm、仿真、双臂、采集与算法实验</td></tr>
+  </tbody>
+</table>
+
+<p>两条路径共享“GELLO 角度作为 follower 目标”的思想，但运行时并不串联。启动 <code>start_gello.sh</code> 时，不会经过 <code>GelloAgent</code>、<code>RobotEnv</code> 或 ZMQ；反过来，运行 <code>launch_yaml.py</code> 也不会自动加载 FR3 的 ROS 2 关节阻抗控制器。调试时首先要确认自己处于哪条路径。</p>
+
+<h2>1.2 运行时进程边界</h2>
+
+<p>ROS 2 主路径由三个长期进程组组成。Gello Publisher 负责主手硬件和目标发布；Arm Controller 负责机器人描述、Franka 硬件、状态广播器和关节阻抗控制器；Gripper Client 负责夹爪归零、宽度读取和 Move action。根脚本使用 <code>gnome-terminal</code> 或 <code>tmux</code> 将三组进程隔离展示，方便查看日志和单独定位故障。</p>
+
+<h1>2. 仓库结构与模块职责</h1>
+
+<table>
+  <thead><tr><th>路径</th><th>职责</th></tr></thead>
+  <tbody>
+    <tr><td><code>start_gello.sh</code></td><td>真机启动编排、网络/串口检查、配置同步、旧进程清理、就绪门禁和三进程启动</td></tr>
+    <tr><td><code>gello_software/ros2/src/franka_gello_state_publisher</code></td><td>读取 GELLO Dynamixel、完成坐标处理、发布手臂与夹爪目标</td></tr>
+    <tr><td><code>gello_software/ros2/src/franka_fr3_arm_controllers</code></td><td>启动 Franka ros2_control 栈，并提供七轴关节阻抗控制器插件</td></tr>
+    <tr><td><code>gello_software/ros2/src/franka_gripper_manager</code></td><td>把 0～1 夹爪百分比转换为 Franka Hand 或 Robotiq action 命令</td></tr>
+    <tr><td><code>gello_software/gello</code></td><td>上游通用 Python Agent、Robot、相机、ZMQ、数据采集与仿真框架</td></tr>
+    <tr><td><code>gello_software/experiments</code></td><td>通用框架的命令行入口和 YAML 编排</td></tr>
+    <tr><td><code>README_ENVIRONMENT.md</code></td><td>当前机器的 ROS、Franka、Conda/uv、网络、实时性、Docker 和 SSH 约定</td></tr>
+  </tbody>
+</table>
+
+<p>ROS 2 工作区同时存在 <code>src</code> 和 <code>install</code>。源码修改发生在 <code>src</code>；<code>ros2 launch</code> 通过 ament index 通常读取 <code>install/&lt;package&gt;/share</code> 中已安装的 launch 和配置。代码变更后应执行 <code>colcon build</code> 并重新 source；根脚本只对串口和机器人 IP 同时更新源码与已安装配置，它不能代替完整构建。</p>
+
+<h1>3. 启动链路：start_gello.sh 的状态机</h1>
+
+<p><code>start_gello.sh</code> 不参与持续控制，它是一个带安全门禁的启动编排器。其顺序是刻意设计的：先证明 GELLO 能产生有效数据，再允许 FR3 控制器上线，最后等待 Franka action server 后启动夹爪客户端。</p>
+
+<ol>
+  <li seq="auto"><b>解析工作区和运行参数。</b>默认 GELLO ROS 2 工作区为 <code>gello_software/ros2</code>，Franka overlay 为 <code>~/franka_ros2_ws</code>，机器人 IP 为 <code>172.16.0.2</code>。可分别用 <code>GELLO_ROS2_WS</code>、<code>FRANKA_ROS2_WS</code> 和 <code>FRANKA_ROBOT_IP</code> 覆盖。</li>
+  <li seq="auto"><b>选择终端后端。</b>有 DISPLAY 且存在 gnome-terminal 时使用图形窗口，否则优先 tmux。<code>GELLO_TERMINAL_BACKEND</code> 可强制选择，<code>GELLO_TMUX_LAYOUT</code> 支持 panes 或 windows。</li>
+  <li seq="auto"><b>网络门禁。</b>脚本必须能 ping 通 FR3 控制柜，否则在启动任何真机控制进程前退出。</li>
+  <li seq="auto"><b>串口发现与权限检查。</b>优先扫描 <code>/dev/serial/by-id</code> 的稳定符号链接；没有时回退到 ttyUSB/ttyACM。零设备或多设备均停止，单设备才会自动写配置。</li>
+  <li seq="auto"><b>清理旧进程。</b>停止旧的 publisher、gripper client 和三类 launch，必要时升级到 SIGKILL，并重启 ROS 2 daemon，避免串口被占用或旧目标继续流入控制器。</li>
+  <li seq="auto"><b>构造 overlay。</b>每个新终端依次 source ROS Humble、可选的系统 Franka 环境、Franka 工作区和 GELLO ROS 2 工作区。</li>
+  <li seq="auto"><b>只启动 GELLO Publisher。</b>脚本最多等待 60 秒，不仅检查 topic 是否出现，还用 <code>ros2 topic echo --once</code> 验证消息中确实有 position。</li>
+  <li seq="auto"><b>人工姿态确认窗口。</b>打印第一帧并等待 5 秒，让操作者确认 GELLO 与 FR3 当前姿态接近，期间可 Ctrl-C 取消。</li>
+  <li seq="auto"><b>启动 Arm Controller。</b>加载 Franka 硬件、状态广播器和关节阻抗控制器。</li>
+  <li seq="auto"><b>等待 12 秒后启动 Gripper Client。</b>给 ros2_control 和 Franka gripper action server 留出初始化时间。</li>
+</ol>
+
+<h2>3.1 配置同步的真实含义</h2>
+
+<p>脚本将检测到的串口写入 <code>example_single.yaml</code>，并将目标 IP 写入 <code>example_fr3_config.yaml</code>。两者都同时修改 <code>src</code> 和 <code>install</code> 副本：前者保证源码侧持久，后者保证当前未重新构建时的 launch 立即读取到新值。其他参数修改仍应以源码为准并重新构建，避免源码与安装树长期漂移。</p>
+
+<h2>3.2 串口路径的已知边界</h2>
+
+<p><code>main.launch.py</code> 当前固定执行 <code>"/dev/serial/by-id/" + config["com_port"]</code>。因此最稳定的配置是 YAML 仅存 by-id 文件名。如果脚本回退到完整的 <code>/dev/ttyUSB0</code>，launch 仍会追加 by-id 前缀，可能形成无效路径。生产环境应确保 udev/by-id 可用；若必须使用 ttyUSB/ttyACM，应先修正 launch 对绝对路径的判断逻辑。</p>
+
+<h1>4. GELLO 硬件层：从 Dynamixel 寄存器到连续关节角</h1>
+
+<h2>4.1 设备模型与总线</h2>
+
+<p>单臂配置中 <code>num_arm_joints=7</code> 且 <code>gripper=true</code>，因此 <code>GelloHardware</code> 创建 ID 1～8 的 Dynamixel 驱动。ID 1～7 对应主手七个转动关节，ID 8 对应夹爪。串口波特率为 57600。驱动启动后持续轮询当前位置，发布器定时器从驱动缓存获取最新角度。</p>
+
+<p>GELLO 不是简单的无源编码器集合。初始化会按固定依赖顺序写入 operating mode、goal current、PID、torque enable 和 goal position。当前 operating mode 为 5（current-based position mode），电流限制为 600 mA。<code>dynamixel_torque_enable</code> 可以逐电机控制是否启用力矩；关闭节点时发布器会显式关闭全部 GELLO 电机力矩。</p>
+
+<h2>4.2 参数模型</h2>
+
+<table>
+  <thead><tr><th>参数</th><th>含义</th><th>错误表现</th></tr></thead>
+  <tbody>
+    <tr><td><code>com_port</code></td><td>GELLO USB 串口</td><td>节点初始化失败、无 joint state</td></tr>
+    <tr><td><code>num_arm_joints</code></td><td>主手臂关节数，FR3 为 7</td><td>数组维度、ID 和消息维度错误</td></tr>
+    <tr><td><code>joint_signs</code></td><td>每轴方向映射，取 +1 或 -1</td><td>某轴反向跟随</td></tr>
+    <tr><td><code>assembly_offsets</code></td><td>机械装配零位补偿，单位 rad</td><td>整体零位偏移或启动目标异常</td></tr>
+    <tr><td><code>gripper_range_rad</code></td><td>GELLO 夹爪的闭合/张开原始角范围</td><td>夹爪行程不足、方向反、过早饱和</td></tr>
+    <tr><td><code>dynamixel_kp_p/i/d</code></td><td>GELLO 电机自身控制器参数</td><td>主手阻尼/保持特性异常</td></tr>
+    <tr><td><code>dynamixel_torque_enable</code></td><td>每个 Dynamixel 是否上力</td><td>主手无反馈或不应上力时突然动作</td></tr>
+    <tr><td><code>dynamixel_goal_position</code></td><td>启用位置相关模式时的目标</td><td>初始化主手姿态与预期不同</td></tr>
+  </tbody>
+</table>
+
+<h2>4.3 初始绝对角归一化</h2>
+
+<p>Dynamixel 上电后的内部位置存在 2π 周期歧义，且电机安装方向和机械零位与 FR3 坐标系不同。启动时首先读取七个原始角 <code>q_raw</code>，再计算：</p>
+
+<pre lang="text" caption="概念公式"><code>q0 = wrap_to_mid_range((q_raw - assembly_offset) × joint_sign,
+                       center = FR3_joint_limit_midpoint)</code></pre>
+
+<p><code>wrap_to_mid_range</code> 将每轴落入以 FR3 关节限位中点为中心、宽度 2π 的区间。这一步只用于确定启动时的绝对分支，解决“同一个电机角可能对应多圈位置”的问题。</p>
+
+<h2>4.4 运行时连续角跟踪</h2>
+
+<p>启动完成后，系统不再每帧重新做 modulo 归一化，而是用相邻原始读数的增量保持连续性：</p>
+
+<pre lang="text" caption="连续更新"><code>Δq = (q_raw_now - q_raw_prev) × joint_sign
+q_processed_now = q_processed_prev + Δq
+q_target = clip(q_processed_now, FR3_lower_limit, FR3_upper_limit)</code></pre>
+
+<p>这种“首次定分支、随后积累增量”的设计避免角度跨 0/2π 时目标突然跳变。最后对发布值执行 FR3 关节限位裁剪。需要注意，内部累计值保留未裁剪结果；如果主手长期越过 follower 的物理限位，发布值会停在边界，回到合法区间后才恢复跟随，操作者会感到一段“空行程”。</p>
+
+<h2>4.5 夹爪归一化</h2>
+
+<p>夹爪原始角通过线性映射转换为 0～1：</p>
+
+<pre lang="text" caption="夹爪百分比"><code>percent = (raw - range_min) / (range_max - range_min)
+percent = clamp(percent, 0, 1)</code></pre>
+
+<p>这里的 0/1 语义最终由配置范围顺序决定。标定时应分别记录完全闭合和完全张开角度，再在真机低速下验证方向。</p>
+
+<h1>5. ROS 2 发布层：gello_publisher</h1>
+
+<p><code>GelloPublisher</code> 是 rclpy 节点，节点名为 <code>gello_publisher</code>。launch 从 YAML 中逐项创建节点，因此同一套代码可通过 namespace 扩展为双臂。节点声明所有硬件参数、构造 <code>GelloHardware</code>，然后创建 25 Hz 定时器。</p>
+
+<table>
+  <thead><tr><th>接口</th><th>类型</th><th>默认相对名</th><th>用途</th></tr></thead>
+  <tbody>
+    <tr><td>手臂目标</td><td><code>sensor_msgs/msg/JointState</code></td><td><code>gello/joint_states</code></td><td>七维 FR3 目标关节角</td></tr>
+    <tr><td>夹爪目标</td><td><code>std_msgs/msg/Float32</code></td><td><code>gripper/gripper_client/target_gripper_width_percent</code></td><td>0～1 的张开比例</td></tr>
+    <tr><td>动态参数事件</td><td><code>rcl_interfaces/msg/ParameterEvent</code></td><td><code>/parameter_events</code></td><td>运行时更新 dynamixel_* 参数</td></tr>
+  </tbody>
+</table>
+
+<p>单臂空 namespace 下，两个相对名解析为 <code>/gello/joint_states</code> 和 <code>/gripper/gripper_client/target_gripper_width_percent</code>。JointState 的 name 固定为 <code>fr3_joint1</code> 到 <code>fr3_joint7</code>，frame_id 为 <code>fr3_link0</code>，header stamp 使用 ROS 节点当前时钟。控制器当前按 position 数组前七项读取，并未按 name 重新排序，因此数组顺序是实际接口契约。</p>
+
+<p>publisher 和订阅者均使用深度 10 的普通 QoS（控制器订阅深度为 1）。系统依赖低延迟的最新目标，不需要历史回放。若跨主机或更改 DDS 配置，应重新检查可靠性、延迟和时钟一致性。</p>
+
+<h1>6. FR3 ros2_control 启动层</h1>
+
+<h2>6.1 高层 launch</h2>
+
+<p><code>franka_fr3_arm_controllers.launch.py</code> 读取机器人 YAML。每个条目先 include <code>franka.launch.py</code>，再启动 <code>joint_impedance_controller</code> spawner。YAML 决定 arm_id、namespace、URDF、机器人 IP、是否加载夹爪、真假硬件、状态源和状态发布频率。</p>
+
+<h2>6.2 franka.launch.py 生成的组件</h2>
+
+<ol>
+  <li seq="auto"><b>robot_state_publisher：</b>持有由 xacro 展开的 robot_description，发布 TF。</li>
+  <li seq="auto"><b>ros2_control_node：</b>加载 Franka hardware interface、控制器配置和机器人描述；退出时触发整个 launch shutdown。</li>
+  <li seq="auto"><b>joint_state_publisher：</b>聚合手臂与夹爪 joint state，默认 30 Hz。</li>
+  <li seq="auto"><b>joint_state_broadcaster：</b>发布 ros2_control 关节状态。</li>
+  <li seq="auto"><b>franka_robot_state_broadcaster：</b>真机模式下发布 Franka 专有机器人状态。</li>
+  <li seq="auto"><b>franka_gripper/gripper.launch.py：</b>load_gripper=true 时启动 Franka Hand action server。</li>
+</ol>
+
+<p><code>controllers.yaml</code> 将 controller_manager 的 update_rate 设为 1000 Hz，并注册三个控制器。自定义插件通过 <code>franka_fr3_arm_controllers.xml</code> 导出为 <code>franka_fr3_arm_controllers/JointImpedanceController</code>。</p>
+
+<h1>7. 关节阻抗控制器：目标如何变成力矩</h1>
+
+<h2>7.1 接口声明</h2>
+
+<p>控制器对每个 <code>fr3_joint1..7</code> 申请一个 effort command interface，并申请 position 与 velocity state interface。命名会结合 namespace 和 arm_id，以便双臂时区分硬件接口。</p>
+
+<h2>7.2 生命周期与启动行为</h2>
+
+<p><b>on_init：</b>声明 arm_id、k_gains 和 d_gains。<b>on_configure：</b>读取刚度、阻尼和速度滤波参数，获取 robot_description，并订阅 <code>gello/joint_states</code>。<b>on_activate：</b>初始化时间戳和速度滤波状态。之后 controller_manager 每 1 ms 调用一次 <code>update</code>。</p>
+
+<p>控制器上线后不是立刻追随。它先等待有效 GELLO 消息；等待期间向七个关节写零力矩。收到有效目标后，用 <code>MotionGenerator</code> 从 FR3 当前姿态平滑移动到第一帧 GELLO 姿态，速度因子为 0.2。初始轨迹完成后才进入持续跟随模式。</p>
+
+<h2>7.3 数据有效性与失联保护</h2>
+
+<p>回调要求 position 至少包含七项，随后复制前七项。有效性同时检查“距上一帧的间隔”和“消息 stamp 距当前时间”，阈值均为 0.5 秒。进入正常跟随后，一旦最新数据无效，控制器记录 fatal 并调用 <code>rclcpp::shutdown()</code> 永久退出。</p>
+
+<p>25 Hz 的理论周期为 40 ms，0.5 秒相当于允许约 12 帧缺失。这个阈值是通信容错与失联响应速度的折中。它依赖 publisher 与 controller 使用一致的 ROS 时钟；跨主机部署时必须同步系统时间，若启用 sim time 则所有节点必须一致配置。</p>
+
+<h2>7.4 控制律</h2>
+
+<p>每个 1 kHz 周期先从 state interface 读取实际关节位置 <code>q</code> 和速度 <code>dq</code>，然后对速度做一阶滤波：</p>
+
+<pre lang="text" caption="速度滤波与 PD 关节阻抗"><code>dq_filtered = (1 - k_alpha) × dq_filtered + k_alpha × dq
+tau = K ⊙ (q_goal - q) + D ⊙ (-dq_filtered)</code></pre>
+
+<p>其中 <code>⊙</code> 表示逐元素乘法。当前 <code>k_alpha=0.99</code>，刚度 K 为 [240, 240, 240, 240, 100, 60, 20]，阻尼 D 为 [20, 20, 20, 10, 10, 10, 5]。前四轴刚度较高，腕部逐步降低，以兼顾跟随与柔顺。</p>
+
+<p>该控制器代码只显式计算 PD 力矩，没有在本插件中加入重力、科氏或摩擦补偿项。最终硬件层是否叠加其他项取决于所使用的 Franka ros2_control 接口和版本，调参时不能假设代码外一定存在补偿。刚度/阻尼改动必须小步、单轴、可急停验证。</p>
+
+<h2>7.5 目标刷新与实时循环的关系</h2>
+
+<p>ROS 回调以非实时方式更新最近目标数组；实时 update 循环读取该数组并产生力矩。目标在相邻 GELLO 帧之间是零阶保持，因此 1 kHz 并不创造更多主手信息。降低操作抖动应优先检查机械装配、编码器读数、目标滤波和消息延迟，而不是盲目提高 controller_manager 频率。</p>
+
+<h1>8. 夹爪数据链路</h1>
+
+<h2>8.1 初始化</h2>
+
+<p><code>franka_gripper_client</code> 启动后先等待 Homing action server，发送归零目标并同步等待完成；然后临时订阅 <code>franka_gripper/joint_states</code>，用左指位置的两倍作为最大夹爪宽度；最后创建百分比 topic 订阅和 Move action client。</p>
+
+<h2>8.2 百分比到物理宽度</h2>
+
+<pre lang="text" caption="夹爪命令转换"><code>percent = clamp(msg.data, 0, 1)
+target_width_m = max_width_m × percent</code></pre>
+
+<p>第一帧默认只用于同步，不触发动作（<code>sync_to_first_command=true</code>），避免客户端刚上线时夹爪跳动。后续命令必须同时满足三个条件：上一 action 已完成；距上次发送至少 0.5 秒；目标变化至少达到最大宽度的 5%。满足后以 0.1 m/s 发送 Franka Move goal。</p>
+
+<p>因此 publisher 虽以 25 Hz 发布夹爪百分比，action 端不会以 25 Hz 发送机械动作。死区、最小间隔和单 action in-flight 限制共同实现降频和防抖。它适合位置式开合，不是高带宽力控夹爪链路。</p>
+
+<h2>8.3 Robotiq 分支</h2>
+
+<p>仓库还提供 <code>robotiq_gripper_client.py</code>。它订阅百分比后执行 <code>1-percent</code> 方向转换，并通过 <code>control_msgs/GripperCommand</code> action 控制 Robotiq。当前根启动脚本固定选择 Franka Hand 配置，切换 Robotiq 需要改用对应 launch/YAML 并确认 topic namespace。</p>
+
+<h1>9. ROS 2 图谱与接口契约</h1>
+
+<table>
+  <thead><tr><th>生产者</th><th>接口</th><th>消费者</th><th>关键约束</th></tr></thead>
+  <tbody>
+    <tr><td>gello_publisher</td><td><code>/gello/joint_states</code></td><td>joint_impedance_controller</td><td>position 前七项为 FR3 目标，stamp 新鲜度小于 0.5 s</td></tr>
+    <tr><td>gello_publisher</td><td><code>/gripper/gripper_client/target_gripper_width_percent</code></td><td>franka_gripper_client</td><td>Float32，语义 0～1，客户端再次 clamp</td></tr>
+    <tr><td>joint_state_broadcaster</td><td><code>/franka/joint_states</code></td><td>joint_state_publisher/诊断工具</td><td>实际手臂状态</td></tr>
+    <tr><td>Franka gripper node</td><td><code>/franka_gripper/joint_states</code></td><td>gripper client、状态聚合</td><td>初始化最大宽度所必需</td></tr>
+    <tr><td>franka_gripper_client</td><td><code>/franka_gripper/homing</code></td><td>Franka gripper action server</td><td>启动时同步执行</td></tr>
+    <tr><td>franka_gripper_client</td><td><code>/franka_gripper/move</code></td><td>Franka gripper action server</td><td>width 单位 m，speed 单位 m/s</td></tr>
+  </tbody>
+</table>
+
+<p>namespace 非空时，相对接口会进入对应命名空间。双臂配置必须保证 GELLO publisher、arm controller、gripper client 和底层 Franka action server使用一致 namespace；只改其中一处会出现“节点都在但互相看不见”的故障。</p>
+
+<h1>10. 上游 Python/ZMQ 通用 GELLO 框架</h1>
+
+<p>通用框架采用 Agent–Environment–Robot 分层。<code>GelloAgent.act(obs)</code> 读取主手关节并返回 action；<code>RobotEnv.step(action)</code> 调用 follower 的 <code>command_joint_state</code> 并按配置频率限速；Robot 实现封装 UR、Panda、xArm、YAM、仿真或双臂。ZMQServerRobot 将 num_dofs、get_joint_state、command_joint_state 和 get_observations 暴露成 request/reply RPC，使机器人进程和控制/采集进程可以隔离。</p>
+
+<pre lang="text" caption="通用 Python 路径"><code>GELLO Dynamixel
+  → GelloAgent.act(observation)
+  → numpy action
+  → RobotEnv.step(action)
+  → ZMQClientRobot.command_joint_state
+  → ZMQServerRobot
+  → follower Robot.command_joint_state</code></pre>
+
+<p><code>launch_yaml.py</code> 从 OmegaConf YAML 通过 <code>_target_</code> 动态实例化 agent 和 robot，支持左右臂组合、仿真/真机统一、启动位置插值和 SaveInterface。<code>run_env.py</code> 是较早的命令行路径，包含初始差值检查、每周期最大步长限制和手动端口选择。它们适合研究和数据采集，但并不提供 FR3 ROS 2 控制器中的 1 kHz 力矩环和 0.5 秒消息失联退出机制。</p>
+
+<h1>11. 配置、构建与环境</h1>
+
+<h2>11.1 推荐环境边界</h2>
+
+<p>真机 ROS 2/Franka 节点使用系统 ROS Humble 和工作区 overlay；Python 上游实验环境使用独立 <code>franka-gello</code> Conda 环境并通过 uv 管理依赖。不要把 rclpy、Franka ROS 消息包强行安装进 Conda，也不要把深度学习大依赖塞入真机控制环境。</p>
+
+<h2>11.2 ROS 2 构建</h2>
+
+<pre lang="bash"><code>cd /data/tang_projects/gello_basic_launch/gello_software/ros2
+source /opt/ros/humble/setup.bash
+source /data/tang_projects/franka_ros2_ws/install/setup.bash
+colcon build --symlink-install
+source install/local_setup.bash</code></pre>
+
+<p>Python 节点使用 <code>--symlink-install</code> 时源码更新更容易生效，但配置、launch、C++ 插件和包元数据仍应通过构建验证。每次新终端都要重新 source。overlay 顺序应保持“ROS underlay → Franka overlay → GELLO overlay”。</p>
+
+<h2>11.3 网络与实时性</h2>
+
+<p>当前约定是主机有线网卡 <code>172.16.0.1/24</code>，FR3 为 <code>172.16.0.2</code>。网络可 ping 只是第一层检查，真机 1 kHz 控制还依赖稳定链路、实时权限、CPU 调度和合适内核。当前环境文档记录了 realtime 组、limits 和 lowlatency 内核准备情况；实际启动前应确认当前启动的内核与 ulimit，而不是只看已安装包。</p>
+
+<h1>12. 标定与首次联调</h1>
+
+<ol>
+  <li seq="auto"><b>机械检查。</b>确认 GELLO 关节 ID、线缆、供电、机械零位、活动范围和夹爪结构。</li>
+  <li seq="auto"><b>串口检查。</b>确认唯一稳定的 by-id 路径，当前用户具有读写权限，没有旧进程占用。</li>
+  <li seq="auto"><b>仅启动 publisher。</b>先人工运行 GELLO launch，不连接 FR3 控制器；用 topic echo 逐轴缓慢转动，验证数组顺序、方向、零位、连续性和限位。</li>
+  <li seq="auto"><b>验证夹爪百分比。</b>确认完全闭合/张开分别接近预期端点，运动方向一致且无抖动。</li>
+  <li seq="auto"><b>对齐初始姿态。</b>将 GELLO 摆到接近 FR3 当前姿态，七轴差值应逐项检查，不能只看整体外观。</li>
+  <li seq="auto"><b>低风险启动控制器。</b>确保急停可达、低速、小范围、工作区无人；观察 motion generator 是否平滑进入首目标。</li>
+  <li seq="auto"><b>逐轴验证。</b>每次只给一个小关节输入，确认 follower 方向、幅度、耦合和恢复行为。</li>
+  <li seq="auto"><b>最后启用夹爪。</b>先完成 homing，再验证 deadband、最小间隔、最大宽度和第一帧同步。</li>
+</ol>
+
+<h1>13. 运行、监控与停止</h1>
+
+<pre lang="bash" caption="推荐启动"><code>cd /data/tang_projects/gello_basic_launch
+./start_gello.sh</code></pre>
+
+<pre lang="bash" caption="远程 SSH 下强制 tmux"><code>GELLO_TERMINAL_BACKEND=tmux ./start_gello.sh
+tmux attach -t gello_basic</code></pre>
+
+<p>运行中至少观察：GELLO topic 频率与 stamp、控制器状态、FR3 实际关节状态、夹爪 action 状态、串口错误和网络错误。建议使用：</p>
+
+<pre lang="bash"><code>ros2 node list
+ros2 topic list
+ros2 topic hz /gello/joint_states
+ros2 topic echo --once /gello/joint_states
+ros2 control list_controllers
+ros2 action list
+ros2 topic hz /franka/joint_states</code></pre>
+
+<p>tmux 模式下，标准停止方式是 <code>tmux kill-session -t gello_basic</code>。若异常退出导致残留，可按环境文档中的 pkill 规则清理，并检查串口占用。停止顺序的目标是尽快终止向 FR3 输出命令，同时确保 GELLO 节点的清理逻辑有机会关闭主手电机力矩；强制 SIGKILL 只作为残留进程兜底。</p>
+
+<h1>14. 故障定位：按数据链路逐段排查</h1>
+
+<table>
+  <thead><tr><th>现象</th><th>优先检查</th><th>解释</th></tr></thead>
+  <tbody>
+    <tr><td>无 <code>/gello/joint_states</code></td><td>by-id 路径、权限、串口占用、Dynamixel ID/供电、publisher 日志</td><td>故障在主手硬件或发布层，暂不启动 FR3</td></tr>
+    <tr><td>topic 有数据但某轴反向</td><td><code>joint_signs</code></td><td>不要通过交换关节顺序掩盖方向错误</td></tr>
+    <tr><td>启动姿态偏移</td><td><code>assembly_offsets</code>、初始多圈分支、主手机械零位</td><td>首次归一化决定绝对目标</td></tr>
+    <tr><td>跨零位时跳变</td><td>原始读数连续性、驱动换算、进程是否重启</td><td>正常运行应由增量跟踪消除 2π 跳变</td></tr>
+    <tr><td>FR3 等待 valid joint states</td><td>topic namespace、position 维度、stamp、系统时钟、控制器订阅名</td><td>topic 可见不代表通过有效性验证</td></tr>
+    <tr><td>运行中控制器 fatal 退出</td><td>25 Hz 发布是否中断、DDS 延迟、CPU 卡顿、时钟跳变</td><td>0.5 秒新鲜度门禁触发</td></tr>
+    <tr><td>FR3 振动或过硬</td><td>目标噪声、机械松动、K/D、实时抖动、网络质量</td><td>先消除输入与系统问题，再小步调参</td></tr>
+    <tr><td>夹爪无动作</td><td>homing/move action、joint_states、topic namespace、第一帧同步</td><td>第一帧默认不动是设计行为</td></tr>
+    <tr><td>夹爪动作稀疏</td><td>5% deadband、0.5 s interval、上一 action 是否完成</td><td>客户端主动降频，不是 topic 丢包</td></tr>
+    <tr><td>修改源码不生效</td><td>是否 colcon build、source 的 overlay、运行的是 src 还是 install</td><td>最常见的是安装树仍为旧版本</td></tr>
+  </tbody>
+</table>
+
+<h1>15. 安全机制、边界与已知风险</h1>
+
+<p><b>已有保护。</b>启动脚本先网络/串口检查；FR3 只在收到第一帧 GELLO 后启动；控制器初始采用平滑轨迹；GELLO 目标受 FR3 关节限位裁剪；控制器对消息维度和 0.5 秒新鲜度做检查；夹爪进行 clamp、死区、限频和单 action 串行；节点退出会尝试关闭 GELLO 电机力矩。</p>
+
+<p><b>不能替代的保护。</b>代码中的裁剪和超时不能替代 FR3 本体安全配置、急停、碰撞阈值、工作空间管理、实时网络和人工监护。当前控制器没有显式目标速度/加速度限制用于持续跟随，也没有在消息回调中校验 NaN/Inf、joint name 顺序或每轴跳变量；发布器只做位置限位，不做目标斜率限制。</p>
+
+<p><b>当前实现需要重点留意的工程风险：</b></p>
+
+<ul>
+  <li>launch 固定追加 <code>/dev/serial/by-id/</code>，与 ttyUSB/ttyACM 回退分支不完全兼容。</li>
+  <li>控制器按 position 数组顺序消费目标，未按 joint name 建立映射；任何上游顺序改变都会造成危险错轴。</li>
+  <li>消息有效性依赖 header stamp 与本地 now；跨主机时钟未同步会误触发或错误放行。</li>
+  <li>等待有效输入阶段写零力矩，具体机器人行为依赖 Franka 硬件接口与本体状态，不应把它理解为“绝对静止”。</li>
+  <li>持续跟随没有显式每周期目标增量限制，GELLO 突跳会直接转化为较大的位置误差和 PD 力矩。</li>
+  <li>配置同时存在 src/install 两份，手工修改一处容易产生漂移。</li>
+  <li>夹爪初始化中的 homing 和最大宽度读取是阻塞步骤；action server 或 joint state 不可用时客户端不能进入服务状态。</li>
+  <li>根脚本用进程模式匹配清理旧节点；同机运行其他相似命令时，应确认不会误伤不在本任务范围内的实例。</li>
+</ul>
+
+<h1>16. 二次开发建议</h1>
+
+<p><b>输入安全层。</b>在 publisher 与 controller 之间增加 NaN/Inf、joint name/维度、每轴最大跳变、速度/加速度、软限位裕度和序列号检查；控制器实时线程使用 realtime-safe buffer 交换目标。</p>
+
+<p><b>状态机可观测性。</b>把 WAITING_INPUT、MOVING_TO_START、TRACKING、INPUT_TIMEOUT、ERROR 等状态显式发布为诊断消息，并记录最近有效帧时间、最大目标跳变和控制误差。</p>
+
+<p><b>配置单一来源。</b>避免脚本同时 sed 源码与安装树。更稳妥的做法是让 launch 接受绝对配置路径或直接把串口/IP 作为 launch argument，构建产物保持只读。</p>
+
+<p><b>双臂扩展。</b>仓库已有 example_duo YAML 和 namespace 结构。扩展时必须为左右 GELLO、FR3、控制器、夹爪 action、joint state 和终端日志建立完全对称且互不冲突的 namespace，并分别执行就绪门禁；不能只把单臂配置复制两份。</p>
+
+<p><b>数据采集。</b>通用 Python 框架已有 SaveInterface、相机接口和 observation 字典。若要采集 ROS 2 真机链路数据，可选择 rosbag2 录制目标、实际关节状态、机器人状态、夹爪状态和相机，也可实现 ROS 2 到现有数据格式的桥接。必须同时记录时间戳和配置版本，才能离线对齐。</p>
+
+<p><b>测试分层。</b>建议建立：纯函数测试（offset/sign/wrap/clip）、Dynamixel fake driver 测试、ROS 2 topic 合约测试、fake_hardware 集成测试、消息超时与跳变故障注入、最后才是真机小范围验收。</p>
+
+<h1>17. 推荐运维检查单</h1>
+
+<h2>17.1 启动前</h2>
+
+<checkbox done="false">急停可达，工作空间无人，FR3 与 GELLO 姿态接近</checkbox>
+<checkbox done="false">主机网络为 172.16.0.1/24，控制柜 IP 可达</checkbox>
+<checkbox done="false">GELLO by-id 唯一、稳定、可读写且未被占用</checkbox>
+<checkbox done="false">ROS/Franka/GELLO overlay 顺序正确</checkbox>
+<checkbox done="false">使用的 YAML、namespace、robot_ip、joint_signs、offset 与夹爪范围已确认</checkbox>
+<checkbox done="false">实时权限、当前内核与 CPU 性能模式符合真机要求</checkbox>
+
+<h2>17.2 启动后</h2>
+
+<checkbox done="false">/gello/joint_states 稳定约 25 Hz，时间戳新鲜，七轴顺序与方向正确</checkbox>
+<checkbox done="false">joint_impedance_controller 为 active，未出现 valid state 或 timeout 警告</checkbox>
+<checkbox done="false">FR3 从当前姿态平滑进入第一帧目标，无突跳和振动</checkbox>
+<checkbox done="false">实际关节状态、目标与运动方向一致</checkbox>
+<checkbox done="false">夹爪 homing 成功，百分比与物理宽度方向一致</checkbox>
+
+<h2>17.3 停止后</h2>
+
+<checkbox done="false">控制器、publisher、gripper client 均已退出</checkbox>
+<checkbox done="false">GELLO 电机力矩已关闭，串口无残留占用</checkbox>
+<checkbox done="false">异常退出的日志、ROS 图和关键 topic 已保存</checkbox>
+
+<h1>18. 关键文件索引</h1>
+
+<table>
+  <thead><tr><th>问题</th><th>首先阅读的文件</th></tr></thead>
+  <tbody>
+    <tr><td>系统如何启动</td><td><code>start_gello.sh</code></td></tr>
+    <tr><td>GELLO YAML 如何变成节点</td><td><code>franka_gello_state_publisher/launch/main.launch.py</code></td></tr>
+    <tr><td>ROS topic 如何发布</td><td><code>gello_publisher.py</code></td></tr>
+    <tr><td>offset/sign/连续角/限位如何处理</td><td><code>gello_hardware.py</code></td></tr>
+    <tr><td>Dynamixel 寄存器通信</td><td><code>franka_gello_state_publisher/dynamixel/driver.py</code></td></tr>
+    <tr><td>Franka 节点和 ros2_control 如何启动</td><td><code>franka_fr3_arm_controllers/launch/franka.launch.py</code></td></tr>
+    <tr><td>目标如何变为关节力矩</td><td><code>joint_impedance_controller.cpp</code></td></tr>
+    <tr><td>首次姿态过渡</td><td><code>motion_generator.cpp</code></td></tr>
+    <tr><td>夹爪 topic 如何变为 action</td><td><code>franka_gripper_client.py</code></td></tr>
+    <tr><td>通用 Python/ZMQ 路径</td><td><code>experiments/launch_yaml.py</code>、<code>gello/agents/gello_agent.py</code>、<code>gello/env.py</code>、<code>gello/zmq_core/robot_node.py</code></td></tr>
+    <tr><td>本机部署约定</td><td><code>README_ENVIRONMENT.md</code></td></tr>
+  </tbody>
+</table>
+
+<h1>19. 总结</h1>
+
+<p><code>gello_basic</code> 的 FR3 主路径是一套“低频目标采样 + 高频实时关节阻抗”的同构遥操作系统。GELLO 端负责把电机原始角可靠地变成连续、定向、带限位的目标关节；ROS 2 负责命名、传输、时间戳和生命周期编排；ros2_control 在 1 kHz 闭环中把目标误差转换为力矩；夹爪通过独立的百分比到 action 链路实现低频位置控制。理解和维护系统时，应始终沿“硬件读数 → 坐标映射 → ROS 消息 → 有效性门禁 → 目标生成 → 力矩/动作 → 实际状态反馈”的完整链条定位，而不是孤立地看某个节点或某个 topic。</p>
