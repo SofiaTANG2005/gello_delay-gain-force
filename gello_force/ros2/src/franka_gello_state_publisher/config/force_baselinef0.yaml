@@ -1,0 +1,93 @@
+SINGLE:
+  namespace: ''
+  com_port: usb-1a86_USB_Serial-if00-port0
+  num_arm_joints: 7
+  joint_signs:
+  - 1
+  - -1
+  - 1
+  - 1
+  - 1
+  - -1
+  - 1
+  gripper: true
+  publishing_rate: 25
+  assembly_offsets:
+  - 0.0
+  - 0.0
+  - 1.571
+  - 1.571
+  - 4.712
+  - 1.571
+  - 3.928
+  gripper_range_rad:
+  - 2.02
+  - 1.26
+  dynamixel_torque_enable:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  dynamixel_goal_position:
+  - 0.0
+  - 0.0
+  - 0.0
+  - -1.571
+  - 0.0
+  - 1.571
+  - 0.0
+  - 3.509
+  dynamixel_kp_p:
+  - 30
+  - 60
+  - 0
+  - 30
+  - 0
+  - 0
+  - 0
+  - 50
+  dynamixel_kp_i:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  dynamixel_kp_d:
+  - 250
+  - 100
+  - 80
+  - 60
+  - 30
+  - 10
+  - 5
+  - 0
+  level: f0
+  field_b: 20.0
+  mobility: 0.05
+  force_limit: 5.0
+  disturbance_speed_limit: 0.12
+  speed_limit: 0.2
+  joint_speed_limit: 0.5
+  master_speed_limit: 4.0
+  displacement_limit: 0.12
+  damping: 0.03
+  timeout: 0.25
+  tracking_error_limit: 0.25
+  ramp_time: 0.5
+  workspace_min:
+  - 0.15
+  - -0.6
+  - 0.1
+  workspace_max:
+  - 0.8
+  - 0.6
+  - 0.85
+  state_topic: /franka/joint_states
+  log_file: /tmp/gello_force_f0.csv

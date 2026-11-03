@@ -1,0 +1,15 @@
+LEFT:
+  namespace: "left"
+  gripper_command_deadband_percent: 0.02
+  gripper_move_speed: 0.1
+  min_command_interval_sec: 0.1
+  target_settle_sec: 0.2
+  sync_to_first_command: true
+
+RIGHT:
+  namespace: "right"
+  gripper_command_deadband_percent: 0.02
+  gripper_move_speed: 0.1
+  min_command_interval_sec: 0.1
+  target_settle_sec: 0.2
+  sync_to_first_command: true

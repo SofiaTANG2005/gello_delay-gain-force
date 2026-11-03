@@ -7,9 +7,9 @@
 | 模式 | 配置 | 注入延迟 |
 |---|---|---:|
 | D0 / baseline | `delay_baseline.yaml` | 0 s（系统固有延迟） |
-| D1 / 250ms | `delay_250ms.yaml` | 0.25 s |
-| D2 / 500ms | `delay_500ms.yaml` | 0.5 s |
-| D3 / 750ms | `delay_750ms.yaml` | 0.75 s |
+| D1 / 200ms | `delay_200ms.yaml` | 0.2 s |
+| D2 / 400ms | `delay_400ms.yaml` | 0.4 s |
+| D3 / 600ms | `delay_600ms.yaml` | 0.6 s |
 
 ## 构建
 
@@ -35,21 +35,21 @@ cd /data/tang_projects/gello_delay
 ./start_delay.sh d0
 ```
 
-D1（额外 250 ms）：
+D1（额外 200 ms）：
 
 ```bash
 cd /data/tang_projects/gello_delay
 ./start_delay.sh d1
 ```
 
-D2（额外 500 ms）：
+D2（额外 400 ms）：
 
 ```bash
 cd /data/tang_projects/gello_delay
 ./start_delay.sh d2
 ```
 
-D3（额外 750 ms）：
+D3（额外 600 ms）：
 
 ```bash
 cd /data/tang_projects/gello_delay
@@ -67,7 +67,7 @@ ros2 topic echo --once /gello/joint_states
 ros2 control list_controllers
 ```
 
-记录设定延迟、主端时间戳、`/gello/joint_states` 发布时间、实际机械臂状态和夹爪状态。夹爪响应延迟需单独测量，不能与该注入量混合。
+记录设定延迟、主端时间戳、`/gello/joint_states` 发布时间、实际机械臂状态和夹爪状态。设定延迟只注入七个机械臂关节；夹爪使用当前 GELLO 读数直接发布，不加入延迟。夹爪自身的通信和执行延迟需单独测量。
 
 ## 配置
 
@@ -75,9 +75,9 @@ ros2 control list_controllers
 
 ```text
 /data/tang_projects/gello_delay/ros2/src/franka_gello_state_publisher/config/delay_baseline.yaml
-/data/tang_projects/gello_delay/ros2/src/franka_gello_state_publisher/config/delay_250ms.yaml
-/data/tang_projects/gello_delay/ros2/src/franka_gello_state_publisher/config/delay_500ms.yaml
-/data/tang_projects/gello_delay/ros2/src/franka_gello_state_publisher/config/delay_750ms.yaml
+/data/tang_projects/gello_delay/ros2/src/franka_gello_state_publisher/config/delay_200ms.yaml
+/data/tang_projects/gello_delay/ros2/src/franka_gello_state_publisher/config/delay_400ms.yaml
+/data/tang_projects/gello_delay/ros2/src/franka_gello_state_publisher/config/delay_600ms.yaml
 ```
 
 若串口设备名变化，修改四个文件的 `com_port`。首次真机测试应小幅、低速，并保持急停可用。

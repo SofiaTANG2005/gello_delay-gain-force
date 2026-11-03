@@ -10,6 +10,19 @@ case "$MODE" in
   *) echo "用法: $0 {g0|g1|g2|g3|g4}"; exit 2;;
 esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Only one GELLO publisher may own the Dynamixel serial bus and /gello/joint_states.
+LOCK_DIR="/tmp/gello_ros_control.lock"
+if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+  echo "检测到已有 GELLO 控制链路，正在切换到 gain..." >&2
+  pkill -TERM -f 'ros2 launch franka_gello_state_publisher|ros2 launch franka_fr3_arm_controllers|ros2 launch franka_gripper_manager|gello_publisher' 2>/dev/null || true
+  sleep 2
+  pkill -KILL -f 'ros2 launch franka_gello_state_publisher|ros2 launch franka_fr3_arm_controllers|ros2 launch franka_gripper_manager|gello_publisher' 2>/dev/null || true
+  rm -rf "${LOCK_DIR}"
+  mkdir "${LOCK_DIR}"
+fi
+cleanup_lock(){ rmdir "${LOCK_DIR}" 2>/dev/null || true; }
+trap cleanup_lock EXIT
+
 WS="${ROOT}/ros2"
 if [[ ! -f "${WS}/install/setup.bash" ]]; then
   echo "首次运行请先构建: cd ${WS} && colcon build --symlink-install" >&2; exit 1
@@ -52,7 +65,7 @@ if [[ "${RESOLVED_GELLO_MODULE}" != "${GAIN_PYTHON_BUILD}"/* ]]; then
 fi
 echo "GELLO 配置: ${CONFIG}; Python 模块: ${RESOLVED_GELLO_MODULE}"
 echo "启动真机 GELLO + FR3, gain=${MODE}; Ctrl-C 退出"
-cleanup() { kill ${PIDS:-} 2>/dev/null || true; }
+cleanup() { kill ${PIDS:-} 2>/dev/null || true; rmdir "${LOCK_DIR}" 2>/dev/null || true; }
 trap cleanup INT TERM EXIT
 ros2 launch franka_gello_state_publisher main.launch.py config_file:="${CONFIG}" & PIDS="$!"
 sleep 2

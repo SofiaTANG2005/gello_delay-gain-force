@@ -1,0 +1,7 @@
+robot1:
+  namespace: ""
+  gripper_command_deadband_percent: 0.02
+  gripper_move_speed: 0.2           # Faster: 0.1 -> 0.2 m/s
+  min_command_interval_sec: 0.05    # Faster: 0.1 -> 0.05 s (50ms)
+  target_settle_sec: 0.05           # Faster: 0.2 -> 0.05 s (50ms)
+  sync_to_first_command: true

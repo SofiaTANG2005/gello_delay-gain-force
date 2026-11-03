@@ -1,0 +1,24 @@
+# Gripper Parameters Reference
+# 原始默认值 (代码中的 DEFAULT_* 常量)
+original_defaults:
+  gripper_command_deadband_percent: 0.02
+  gripper_move_speed: 0.1               # m/s
+  min_command_interval_sec: 0.1         # 100ms
+  target_settle_sec: 0.2                # 200ms - 主要延迟来源
+  sync_to_first_command: true
+
+# 当前优化值 (2026-08-20)
+current_optimized:
+  gripper_command_deadband_percent: 0.02
+  gripper_move_speed: 0.2               # 加速 2x
+  min_command_interval_sec: 0.05        # 减半至 50ms
+  target_settle_sec: 0.05               # 减至 50ms (原来 200ms)
+  sync_to_first_command: true
+
+# 激进优化值 (如果仍有延迟可尝试)
+aggressive:
+  gripper_command_deadband_percent: 0.01
+  gripper_move_speed: 0.3               # 更快
+  min_command_interval_sec: 0.02        # 20ms
+  target_settle_sec: 0.02               # 20ms
+  sync_to_first_command: true

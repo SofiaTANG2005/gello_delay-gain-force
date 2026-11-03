@@ -182,6 +182,11 @@ class FakeDynamixelDriver(DynamixelDriverProtocol):
 
 
 class DynamixelDriver(DynamixelDriverProtocol):
+    # The teleoperation publisher runs at 25 Hz.  Polling the 8 motors as fast
+    # as possible on a 57600 baud bus saturates the serial link and makes the
+    # publisher observe repeated/late samples.  A bounded rate leaves enough
+    # bandwidth and still provides fresh samples between publisher ticks.
+    JOINT_POLLING_HZ = 100.0
     def __init__(
         self,
         ids: Sequence[int],
@@ -374,14 +379,16 @@ class DynamixelDriver(DynamixelDriverProtocol):
         # Continuously read joint positions and update the _buffered_joint_positions array
 
         while not self._stop_thread.is_set():
-            time.sleep(0.001)
             try:
                 self._buffered_joint_positions = np.array(
                     self.read_value_by_name("present_position"), dtype=int
                 )
             except RuntimeError as e:
                 print(f"Warning: {e}")
-                continue
+            # Do not spin at the serial-port's maximum rate.  In particular,
+            # sleeping after errors prevents a disconnected bus from turning
+            # into a tight retry loop.
+            self._stop_thread.wait(1.0 / self.JOINT_POLLING_HZ)
 
     def get_joints(self) -> np.ndarray:
         if self._is_polling:

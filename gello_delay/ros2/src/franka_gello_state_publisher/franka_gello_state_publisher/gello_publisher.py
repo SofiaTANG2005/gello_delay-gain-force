@@ -67,7 +67,7 @@ class GelloPublisher(Node):
             self.gello_hardware.update_dynamixel_control_parameter(param.name, param_value)
 
     def publish_joint_jog(self) -> None:
-        """Publish joint states and gripper position, delayed by self.DELAY."""
+        """Publish delayed arm joints and the current, non-delayed gripper position."""
         JOINT_NAMES = [
             "fr3_joint1",
             "fr3_joint2",
@@ -80,11 +80,11 @@ class GelloPublisher(Node):
         [gello_arm_joints, gripper_position] = self.gello_hardware.get_joint_and_gripper_positions()
 
         now = time.monotonic()
-        self._joint_history.append((now, gello_arm_joints, gripper_position))
+        self._joint_history.append((now, gello_arm_joints))
         target_time = now - self.DELAY
         while len(self._joint_history) >= 2 and self._joint_history[1][0] <= target_time:
             self._joint_history.popleft()
-        _, delayed_arm_joints, delayed_gripper = self._joint_history[0]
+        _, delayed_arm_joints = self._joint_history[0]
 
         arm_joint_states = JointState()
         arm_joint_states.header.stamp = self.get_clock().now().to_msg()
@@ -93,7 +93,7 @@ class GelloPublisher(Node):
         arm_joint_states.position = delayed_arm_joints.tolist()
 
         gripper_joint_states = Float32()
-        gripper_joint_states.data = delayed_gripper
+        gripper_joint_states.data = gripper_position
         self.arm_joint_publisher.publish(arm_joint_states)
         self.gripper_joint_publisher.publish(gripper_joint_states)
 

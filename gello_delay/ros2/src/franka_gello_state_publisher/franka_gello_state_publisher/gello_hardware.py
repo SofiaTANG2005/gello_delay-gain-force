@@ -148,6 +148,7 @@ class GelloHardware:
         self._assembly_offsets = np.array(hardware_config["assembly_offsets"])
 
         self._initialize_driver()
+        self._closed = False
 
         self._initial_arm_joints_raw = self._driver.get_joints()[: self._num_arm_joints]
 
@@ -258,7 +259,14 @@ class GelloHardware:
 
     def disable_torque(self) -> None:
         """Disable torque on all joints."""
+        if self._closed:
+            return
         self._driver.write_value_by_name("torque_enable", [0] * len(self._driver._ids))
+        # Stop the polling thread before releasing the serial port.  Leaving
+        # it alive during ROS shutdown can race the final write and leave a
+        # stale reader competing with the next run.
+        self._driver.close()
+        self._closed = True
 
     def _goal_position_to_pulses(self, goals: list[float]) -> list[int]:
         """Convert goal positions from radians to dynamixel pulses."""
